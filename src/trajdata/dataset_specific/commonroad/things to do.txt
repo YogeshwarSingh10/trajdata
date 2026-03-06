@@ -1,0 +1,21 @@
+
+5. DOUBT: To confirm if trajdata expects data (and FixedExtent in get_agent_info()) as l,b,w or is it like "length from origin of Agent", in which case what does it really take as origin of Agent?
+
+6. QUESTION: CommonRoad and trajdata (gotta know for BOTH) take z=0 or z = (h/2) as "position of car"
+
+7. NOTE: Remember to only use dt = 0.01 and drop scenarios that dont follow that dt (idk how tho, maybe during the dataset_obj creation? recheck that ugh)
+
+8. Change cache_maps() such that the name of each map is not commonroad_1882 instead its the scenario's name (or the map's name, hoga hi commonroad mei kuch vaisa.), clearer that way.
+
+
+----Right Now----
+
+1. [SOLVED] 
+    -> Why is get_scenario_length and len(trajectory.state_list) different?
+    -> means that the length of (time step wise) of each dynamic obstacle is NOT the same? well thats good that we handled it in our functions but ya.
+
+2. Why (when initializing with trajdata), am getting nan values still?
+
+3. Can introduce usage of diferent env_name for ARG, BEl, DEU etc.... --> will be better managed. Can name them as commonroad_ARG etc.
+
+3. 

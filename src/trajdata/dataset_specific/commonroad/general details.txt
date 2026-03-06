@@ -1,0 +1,94 @@
+
+8. Caching levels (FROM CLAUDE RESPONSE, not rechecked personally): 
+
+    L1 : Environment Metadata Cache (Lightest)
+        -> EnvMetadata gets cached 
+        -> List of all Scenes in dataste also cached
+        -> Location :  ~/.unified_data_cache/env_cache/
+        -> To avoid scanning entire dataset just to know what scenes exist
+
+    L2 : Scene Metadata Cache
+        -> Scene metadata cached as Scene object. (yes Scene also stores metadata only, not raw contents)
+        -> Location : ~/.unified_data_cache/{dataset_name}/{scene_name}/scene_info.pkl
+        -> To avoid loading the trajectory data just to know the scene's structure
+    
+    L3 : Processed Trajectory Data Cache
+        -> All agent trajectories as processed DataFrames
+        -> Example #DataFrame structure:
+                agent_id    scene_ts     x      y      z     vx     vy    ax    ay  heading  length width height
+        -> Location : ~/.unified_data_cache/{dataset_name}/{scene_name}/agent_data.parquet 
+        -> (Personal thought) I think it must be one-per-scene type of Dataframe, cuz obviously look at the Location + structure + it makes sense too.
+        -> This is the actual training data. Raw files would be too slow to load repeatedly.
+
+    L4 : Map Data Cache
+        -> Has Multiple formats. Content =  Processed map information
+        -> map_data/
+            ├── vector_map.pkl          # VectorMap object
+            ├── raster_map_100px.png    # Rasterized map at 100px resolution  
+            └── lane_graph.pkl          # Lane connectivity graph
+        -> Location : ~/.unified_data_cache/{dataset_name}/{scene_name}/map_data/
+
+    L5 : Data Index Cache (Query Optimization)
+        -> Pre-computed valid data points
+        -> # E.g, for agent-centric:
+                [
+                    ("scene_0_path", 150, [("ego", [10, 80]), ("agent_123", [0, 70])]),
+                    ("scene_1_path", 200, [("ego", [5, 190]), ("agent_456", [20, 150])])
+                ]
+        -> # Meaning: scene_0 has 150 total samples, ego is valid from timestep 10-80, etc.
+        -> Location : ~/.unified_data_cache/data_indexes/{hash}/data_index.dill
+        -> Avoid re-scanning all cached scenes to find valid training samples.
+
+9. Caching Workflow (Claude response) :
+    # 1. Scan raw files → Create EnvMetadata → Cache
+    # 2. For each scene: Load raw → Extract AgentMetadata → Cache Scene
+    # 3. For each scene: Load raw → Process trajectories → Cache DataFrame  
+    # 4. Build data index from cached scenes → Cache index
+
+10. Initial testing (just seeing it visually by my eyes) suggests that IN GENERAL, timesteps of each dynamic_obstacle is mostly equal to scenario's length only. (for each of the obstacle)
+    -> but still nice to put a check before passing the scenario into dataframe. Bcuz then why else would they make final_timestep an obstacle's property rather than a scene's 
+
+11. dataset[i] returns an AgentBatchElement. 
+    -> Each AgentBatchElement is a snapshot of an agent (agent-centric) that (can) include :
+        -> curr_agent_state : StateArray or StateTensor : its own current state.
+        -> agent_hist (its own history)
+        -> agent_fut (its future)
+        -> maps - its *local* surrounding, and that map can be either rasterized or vectorized
+        -> information on its neighbours, dictated by agent_interaction_distances parameter
+
+11. Inside UnifiedDataset, the indexing logic (roughly) looks like:
+    ->  for each scene:
+            for each agent in scene:
+                for each valid center_timestep t0:
+                    yield AgentBatchElement(agent_id, t0)
+
+11. Thus, its pretty clear that a single agent will also definitely have multple sample points in your agent-centric dataset (at each t_0, i.e at each anchor point).
+    -> This makes sense so as to create multiple data points from the same scene ans use it to train your models. Because models are usually required to make predictions based on ANY past snapshot in time.
+    -> Thus while generating your dataset object, you can specify what all charecteristics u want your specific AgentBatchElements to have via the arguments of UnifiedDataset().
+        -> e.g if u want that all your agents have at least 3 seconds (or max 3 seconds) of history, u can very well set that. Then dataset will contain only those AgentBatchElements then.
+
+11. state_format : 
+    -> Trajdata functions on using a state_format : str, using which it dynamically generates the StateArray or StateTensor class definitions at runtime.
+
+12. dataloader returns an AgentBatch (which may be iterated over)
+    -> Purpose is to make batches from dataset for training purposes.
+    -> The batches are made by using the collate_fn specified.
+
+13. dataset itself by default contains all states as StateArray (as its designed to be platform independent, so just uses numpy.)
+    -> dataloader converts it and its batches actually have states as StateTensor objects.
+        -> This is for faster GPU loading of your *batches* etc, and its cuz the default dataset.get_collate_fn does a StateTensor.from_numpy() internally on each element. Thus you get a module design.
+        -> Doesn't mean u can't create StateTensor objects without the dataloader, (just use StateTensor.from_numpy()), its just more standard workflow.
+    ->  The api for accessing any property etc. is the same for both StateArray and StateTensor objects.
+
+14. A batch : AgentBatch contains information for 1 or more agents (more precisely, "samples".) in it. The leading dimension of the StateTensor will be = the number of data samples (AgentBatchElements) it contains (which is = batch_size argument). 
+    -> This is one of the reasons why dataloader returns StateTensor not StateArray, because Pytorch Tensors are designed to have flexible number of dimensions. Moreoever the operations are consistent across dimensions. Whereas numpy is stricter and any dimension mismatch is not accepted gracefully, and you'll have to manually stack array instead.
+    -> You can change how many agents your batch must have in batch_size argument in the dataloader.
+
+15. For visualizing an AgentBatch (trajdata by default uses AgentBatch only everywhere in general btw)
+    ->plot_agent_batch used to plot single AgentBatchElemnt at a time, tabhi it has a batch_idx paramater
+
+16. (Pretty Obvious by now but still). For commonroad, the dataset structure/hierarchy will be like this :
+    ->  env_name	"commonroad"	Constant, like other datasets (nuplan_mini, etc.)
+        scene name	"DEU_Frankfurt-1_2_T-1"	Taken directly from the CommonRoad scenario file name
+        map_location	same as scene_name	Because each scenario has its own local map
+        map_id	same as map_location	Trajdata doesn’t separately distinguish map_id vs location, they’re equivalent

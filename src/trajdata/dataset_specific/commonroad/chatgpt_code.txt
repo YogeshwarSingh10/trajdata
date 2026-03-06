@@ -1,0 +1,467 @@
+
+
+# -----------------------------------------------------------------------------
+# Scene record structure for caching (simple tuple-compatible record)
+# -----------------------------------------------------------------------------
+class CommonRoadSceneRecord(tuple):
+    """A tiny tuple-like record used for caching scene listings.
+
+    Stored as: (scene_name, scene_location, scene_length, scene_split, raw_data_idx)
+    """
+
+    def __new__(cls, name, location, length, split, idx):
+        return tuple.__new__(cls, (name, location, length, split, idx))
+
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+def cr_type_to_unified_type(cr_type: Any) -> AgentType:
+    """Map CommonRoad obstacle type to trajdata AgentType.
+
+    NOTE: cr_type will depend on how you read the CommonRoad object. CommonRoad
+    defines obstacle types via enums/classes; adapt the mapping accordingly.
+    """
+    # TODO: adapt to actual CommonRoad enums / strings
+    try:
+        # Example placeholders: adapt these to the real enums in your commonroad version
+        if str(cr_type).lower().find("ped") >= 0:
+            return AgentType.PEDESTRIAN
+        if str(cr_type).lower().find("bike") >= 0:
+            return AgentType.BICYCLE
+        if str(cr_type).lower().find("veh") >= 0 or str(cr_type).lower().find("car") >= 0:
+            return AgentType.VEHICLE
+    except Exception:
+        pass
+    return AgentType.UNKNOWN
+
+
+def infer_num_timesteps_from_scenario(scenario: "Scenario") -> int:
+    """Return max time step + 1 across dynamic obstacles in a CommonRoad scenario.
+
+    If the scenario contains no dynamic obstacles, returns 0.
+    """
+    max_ts = -1
+    for dob in getattr(scenario, "dynamic_obstacles", []) or []:
+        traj = getattr(dob, "reference_path", None) or getattr(dob, "trajectory", None)
+        # Different commonroad versions store trajectories differently; try typical fields
+        for state in getattr(dob, "prediction", []) or getattr(dob, "trajectory", []) or []:
+            t = getattr(state, "time_step", None)
+            if t is not None and isinstance(t, (int, np.integer)):
+                max_ts = max(max_ts, int(t))
+        # fallback: some dynamic obstacles have state_list
+        for state in getattr(dob, "state_list", []) or []:
+            t = getattr(state, "time_step", None)
+            if t is not None:
+                max_ts = max(max_ts, int(t))
+
+    return max_ts + 1 if max_ts >= 0 else 0
+
+
+def interpolate_array(arr: np.ndarray) -> np.ndarray:
+    """Interpolate interior NaNs in a 2D numpy array using pandas.
+
+    Leaves leading/trailing NaNs untouched (so we can drop agents with no interior)."""
+    if arr.size == 0:
+        return arr
+    df = pd.DataFrame(arr)
+    df_interp = df.interpolate(limit_area="inside")
+    return df_interp.to_numpy()
+
+
+def infer_extent_from_shape(shape: Any, agent_type: AgentType) -> Tuple[float, float, float]:
+    """Infer length, width, height from a CommonRoad shape object.
+
+    If shape is missing or unparseable, returns reasonable defaults by agent type.
+    """
+    # TODO: implement robust parsing for Rectangle, Circle, Polygon.
+    # For now return simple defaults.
+    if agent_type == AgentType.PEDESTRIAN:
+        return (0.5, 0.5, 1.7)
+    if agent_type == AgentType.BICYCLE:
+        return (1.8, 0.6, 1.5)
+    if agent_type == AgentType.VEHICLE:
+        return (4.5, 1.8, 1.6)
+    return (1.0, 1.0, 1.5)
+
+
+# -----------------------------------------------------------------------------
+# Dataset class skeleton
+# -----------------------------------------------------------------------------
+class CommonRoadDataset(RawDataset):
+    """Skeleton converter: CommonRoad --> trajdata.
+
+    Methods below follow the same interface expected by trajdata's RawDataset
+    implementations (see NuplanDataset / WaymoDataset for examples).
+
+    This skeleton contains TODOs and pseudocode; implement details per your
+    CommonRoad version and file organization.
+    """
+
+    # ----------------------- required RawDataset overrides -------------------
+    def compute_metadata(self, env_name: str, data_dir: str) -> EnvMetadata:
+        """Create EnvMetadata for the CommonRoad collection.
+
+        Responsibilities:
+        - choose dt (per-env). If CommonRoad scenarios have differing dt,
+          decide on canonical dt and plan to resample, or create per-dt envs.
+        - build `scene_split_map` from a user-provided YAML/CSV or default to train.
+        - set map_locations to something like ("commonroad",).
+        """
+        # ----------------- PSEUDOCODE -----------------
+        # 1. try to load a splits.yaml from data_dir / splits.yaml
+        # 2. if not found: put all scenario ids into {'train': [..]}
+        # 3. pick dt: either read per-scenario dt or set a default (0.1)
+
+        # Minimal safe implementation:
+        parts = [("train",)]
+        scene_split_map = defaultdict(lambda: "train")  # lazily map all scenes to train
+        dt = 0.1  # choose a default; consider replacing with detected dt logic
+
+        return EnvMetadata(
+            name=env_name,
+            data_dir=data_dir,
+            dt=dt,
+            parts=parts,
+            scene_split_map=scene_split_map,
+            map_locations=("commonroad",),
+        )
+
+    def load_dataset_obj(self, verbose: bool = False) -> None:
+        """Instantiate CommonRoadObject that can enumerate and load scenarios."""
+        if verbose:
+            print(f"Loading {self.name} (CommonRoad) dataset...")
+        self.dataset_obj = CommonRoadObject(Path(self.metadata.data_dir))
+
+    def _get_matching_scenes_from_obj(
+        self,
+        scene_tag: SceneTag,
+        scene_desc_contains: Optional[List[str]],
+        env_cache: EnvCache,
+    ) -> List[SceneMetadata]:
+        """Scan dataset_obj.scenarios, filter by scene_tag (split/location),
+        cache all scenes, and return scene metadata list for matches.
+        """
+        all_scenes_list: List[CommonRoadSceneRecord] = []
+        scenes_list: List[SceneMetadata] = []
+
+        default_split = "train"
+        for idx, rec in enumerate(self.dataset_obj.scenarios):
+            scene_name = rec["name"]
+            scene_location = rec.get("location", "commonroad")
+            scene_length = int(rec.get("num_timesteps", 0))
+            originating_id = rec.get("scenario_id", scene_name)
+            scene_split = self.metadata.scene_split_map.get(originating_id, default_split)
+
+            # Skip if too short
+            if scene_length <= 1:
+                continue
+
+            all_scenes_list.append(CommonRoadSceneRecord(scene_name, scene_location, scene_length, scene_split, idx))
+
+            if scene_location in scene_tag and scene_split in scene_tag and scene_desc_contains is None:
+                scene_metadata = SceneMetadata(env_name=self.metadata.name, name=scene_name, dt=self.metadata.dt, raw_data_idx=idx)
+                scenes_list.append(scene_metadata)
+
+        # cache the full list for faster subsequent loads
+        self.cache_all_scenes_list(env_cache, all_scenes_list)
+        return scenes_list
+
+    def _get_matching_scenes_from_cache(
+        self,
+        scene_tag: SceneTag,
+        scene_desc_contains: Optional[List[str]],
+        env_cache: EnvCache,
+    ) -> List[Scene]:
+        """Load cached scene list and return Scene objects matching tags.
+
+        Can be implemented later for speed; skeleton provided.
+        """
+        all_scenes_list = env_cache.load_env_scenes_list(self.name)
+        scenes_list: List[Scene] = []
+        default_split = "train"
+        for scene_record in all_scenes_list:
+            scene_name, scene_location, scene_length, scene_split, data_idx = scene_record
+            if scene_location in scene_tag and scene_split in scene_tag and scene_desc_contains is None:
+                scene = Scene(self.metadata, scene_name, scene_location, scene_split, int(scene_length), data_idx, None)
+                scenes_list.append(scene)
+        return scenes_list
+
+    def get_scene(self, scene_info: SceneMetadata) -> Scene:
+        """Materialize a Scene object from SceneMetadata (index into dataset_obj).
+
+        This should fill raw_record or enough information for get_agent_info to
+        call dataset_obj.load_scenario(rec).
+        """
+        _, name, _, data_idx = scene_info
+        rec = self.dataset_obj.scenarios[data_idx]
+        scene_split = self.metadata.scene_split_map.get(rec.get("scenario_id", name), "train")
+        scene_length = int(rec.get("num_timesteps", 0))
+
+        return Scene(self.metadata, name, "commonroad", scene_split, scene_length, data_idx, rec)
+
+    def get_agent_info(
+        self, scene: Scene, cache_path: Path, cache_class: Type[SceneCache]
+    ) -> Tuple[List[AgentMetadata], List[List[AgentMetadata]]]:
+        """Extract agents and produce `overall_agents_df` then cache it.
+
+        Core steps (implement carefully):
+        1. load scenario via dataset_obj.load_scenario(rec)
+        2. infer scene length / time indexing
+        3. iterate dynamic_obstacles and build per-agent arrays
+        4. interpolate interior NaNs, compute first/last valid indices
+        5. drop agents with <=1 detection
+        6. compute ax, ay via arr_utils.agent_aware_diff
+        7. assemble AgentMetadata list and agent_presence per timestep
+        8. call cache_class.save_agent_data and save_tls if available
+        """
+        rec = self.dataset_obj.scenarios[scene.raw_data_idx]
+        scenario, planning_problems = self.dataset_obj.load_scenario(rec)
+
+        # Determine timeline length (fallback to scene.length_timesteps)
+        inferred_T = infer_num_timesteps_from_scenario(scenario)
+        scene_T = scene.length_timesteps if scene.length_timesteps > 0 else inferred_T
+
+        agent_list: List[AgentMetadata] = []
+        agent_presence: List[List[AgentMetadata]] = [[] for _ in range(scene_T)]
+
+        # Container for building dataframe
+        all_agent_arrays: List[np.ndarray] = []
+        all_agent_ids: List[str] = []
+        meta_map: Dict[str, Dict[str, Any]] = {}
+
+        # --- iterate dynamic obstacles ---
+        for dob in getattr(scenario, "dynamic_obstacles", []) or []:
+            # NOTE: adapt field names to your CommonRoad version
+            aid = str(getattr(dob, "obstacle_id", getattr(dob, "obstacle_id", "unk")))
+            atype = cr_type_to_unified_type(getattr(dob, "obstacle_type", "unknown"))
+
+            # Prepare per-agent array: columns = x,y,z,vx,vy,heading,length,width,height (z optional)
+            n_cols = 9
+            arr = np.full((scene_T, n_cols), np.nan, dtype=float)
+
+            # Fill arr based on the representation CommonRoad provides
+            # Typical: dob.trajectory.state_list or dob.state_list with time_step, position, orientation, velocity
+            states = getattr(dob, "trajectory", None) or getattr(dob, "state_list", None) or []
+            for st in states:
+                t = getattr(st, "time_step", None)
+                if t is None:
+                    continue
+                t = int(t)
+                if t < 0 or t >= scene_T:
+                    continue
+                # position
+                pos = getattr(st, "position", None)
+                if pos is not None:
+                    x = getattr(pos, "x", np.nan)
+                    y = getattr(pos, "y", np.nan)
+                    z = getattr(pos, "z", 0.0)
+                else:
+                    # Some commonroad versions store center_x/y directly
+                    x = getattr(st, "center_x", np.nan)
+                    y = getattr(st, "center_y", np.nan)
+                    z = getattr(st, "center_z", 0.0)
+
+                # velocity: may be speed scalar or components
+                speed = getattr(st, "speed", None)
+                vx = getattr(st, "velocity_x", None)
+                vy = getattr(st, "velocity_y", None)
+                yaw = getattr(st, "orientation", None) or getattr(st, "heading", None)
+
+                if vx is None or vy is None:
+                    if speed is not None and yaw is not None:
+                        vx = float(speed) * float(np.cos(yaw))
+                        vy = float(speed) * float(np.sin(yaw))
+                    else:
+                        vx = np.nan
+                        vy = np.nan
+
+                arr[t, 0] = x
+                arr[t, 1] = y
+                arr[t, 2] = z
+                arr[t, 3] = vx
+                arr[t, 4] = vy
+                arr[t, 5] = yaw if yaw is not None else np.nan
+
+            # extents: try to infer from shape
+            length, width, height = infer_extent_from_shape(getattr(dob, "shape", None), atype)
+            arr[:, 6] = length
+            arr[:, 7] = width
+            arr[:, 8] = height
+
+            # interpolate interior gaps
+            arr = interpolate_array(arr)
+
+            # determine first/last valid
+            valid_mask = ~np.isnan(arr[:, 0])
+            if valid_mask.sum() <= 1:
+                # skip single-detection agents
+                continue
+
+            first_t = int(np.where(valid_mask)[0][0])
+            last_t = int(np.where(valid_mask)[0][-1])
+
+            all_agent_arrays.append(arr)
+            all_agent_ids.append(aid)
+            meta_map[aid] = {"type": atype, "length": length, "width": width, "height": height, "first_t": first_t, "last_t": last_t}
+
+        # If user / planning problem defines an ego, you can build ego_df here.
+        # For now we do not create a separate ego unless present in scenario/planning_problems.
+
+        # ---------------------------------------------------------------------
+        # Build DataFrame from arrays
+        # ---------------------------------------------------------------------
+        if len(all_agent_arrays) == 0:
+            # Nothing to cache for this scene
+            empty_df = pd.DataFrame(columns=["x","y","z","vx","vy","ax","ay","heading","length","width","height"]) 
+            cache_class.save_agent_data(empty_df, cache_path, scene)
+            # Save empty TLS
+            cache_class.save_traffic_light_data(pd.DataFrame(), cache_path, scene)
+            return [], [[] for _ in range(scene_T)]
+
+        agent_ids_repeated = np.repeat(all_agent_ids, scene_T)
+        frame_ids = np.tile(np.arange(scene_T), len(all_agent_arrays))
+        stacked = np.concatenate(all_agent_arrays, axis=0)
+
+        cols = ["x","y","z","vx","vy","heading","length","width","height"]
+        df = pd.DataFrame(stacked, columns=cols, index=[agent_ids_repeated, frame_ids])
+        df.index.names = ["agent_id","scene_ts"]
+
+        # Drop rows where position is NaN
+        mask = pd.notna(df[["x","y"]]).all(axis=1)
+        df = df.loc[mask]
+
+        # compute ax, ay
+        agent_ids_for_diff = df.index.get_level_values(0).to_numpy()
+        df_reset = df.reset_index(level=1)
+        df_reset[["ax","ay"]] = arr_utils.agent_aware_diff(df_reset[["vx","vy"]].to_numpy(), agent_ids_for_diff[mask.to_numpy()]) / self.metadata.dt
+        # reattach index
+        df = df_reset.set_index(["agent_id","scene_ts"]).sort_index()
+
+        # reorder / ensure final columns order
+        final_cols = ["x","y","z","vx","vy","ax","ay","heading","length","width","height"]
+        df = df.loc[:, final_cols]
+
+        # Save
+        cache_class.save_agent_data(df, cache_path, scene)
+
+        # build AgentMetadata list & agent_presence
+        for aid, meta in meta_map.items():
+            if meta["last_t"] - meta["first_t"] <= 0:
+                continue
+            am = AgentMetadata(name=aid, agent_type=meta["type"], first_timestep=meta["first_t"], last_timestep=meta["last_t"], extent=FixedExtent(length=meta["length"], width=meta["width"], height=meta["height"]))
+            agent_list.append(am)
+            for t in range(am.first_timestep, am.last_timestep + 1):
+                agent_presence[t].append(am)
+
+        # traffic lights: optional; save empty df for now
+        cache_class.save_traffic_light_data(pd.DataFrame(), cache_path, scene)
+
+        return agent_list, agent_presence
+
+    def cache_map(
+        self,
+        data_idx: int,
+        cache_path: Path,
+        map_cache_class: Type[SceneCache],
+        map_params: Dict[str, Any],
+    ) -> None:
+        """Create and cache a VectorMap for a given scenario index.
+
+        Minimal implementation should populate RoadLane elements (center, left_edge,
+        right_edge) and connectivity prev/next/adjacent. Keep extent set.
+        """
+        rec = self.dataset_obj.scenarios[data_idx]
+        scenario, _ = self.dataset_obj.load_scenario(rec)
+
+        vector_map = VectorMap(map_id=f"{self.name}:{rec.get('scenario_id', data_idx)}")
+
+        # Example pseudocode: iterate lanelets from scenario.lanelet_network
+        ln = getattr(scenario, "lanelet_network", None)
+        if ln is None:
+            # nothing to cache
+            map_cache_class.finalize_and_cache_map(cache_path, vector_map, map_params)
+            return
+
+        # Collect extents
+        xs, ys = [], []
+        for ll in getattr(ln, "lanelets", []) or []:
+            left = np.array(getattr(ll, "left_vertices", []))
+            right = np.array(getattr(ll, "right_vertices", []))
+            center = np.array(getattr(ll, "center_vertices", 0.5 * (left + right)))
+            # safe guards
+            if center.size == 0:
+                continue
+            # create RoadLane-like object and add to vector_map
+            # NOTE: use trajdata.vec_map_elements RoadLane / Polyline classes if available
+            # For skeleton: assume VectorMap.add_map_element accepts a RoadLane-like object
+            try:
+                from trajdata.maps.vec_map_elements import RoadLane, Polyline
+
+                lane = RoadLane(id=str(getattr(ll, "lanelet_id", "")), center=Polyline(center), left_edge=Polyline(left) if left.size else None, right_edge=Polyline(right) if right.size else None)
+                # connectivity
+                lane.prev_lanes.update({str(p) for p in getattr(ll, "predecessor", [])})
+                lane.next_lanes.update({str(n) for n in getattr(ll, "successor", [])})
+                vector_map.add_map_element(lane)
+
+                xs.extend(center[:, 0].tolist())
+                ys.extend(center[:, 1].tolist())
+            except Exception:
+                # if vec_map_elements are unavailable or shape mismatch, skip adding
+                continue
+
+        if xs and ys:
+            vector_map.extent = np.array([min(xs), min(ys), 0.0, max(xs), max(ys), 0.0])
+
+        map_cache_class.finalize_and_cache_map(cache_path, vector_map, map_params)
+
+    def cache_maps(self, cache_path: Path, map_cache_class: Type[SceneCache], map_params: Dict[str, Any]) -> None:
+        """Cache maps for all scenarios. Can be parallelized later."""
+        for i, rec in enumerate(self.dataset_obj.scenarios):
+            self.cache_map(i, cache_path, map_cache_class, map_params)
+
+
+# -----------------------------------------------------------------------------
+# Lightweight dataset object to enumerate commonroad files
+# -----------------------------------------------------------------------------
+class CommonRoadObject:
+    def __init__(self, dataset_path: Path):
+        self.base_path = Path(dataset_path)
+        self.scenarios: List[Dict[str, Any]] = self._scan()
+
+    def _scan(self) -> List[Dict[str, Any]]:
+        """Find all commonroad xml files and create lightweight records.
+
+        Each record should minimally contain: name, file, scenario_id, num_timesteps
+        Cache this list to disk yourself if it is expensive to compute.
+        """
+        recs: List[Dict[str, Any]] = []
+        # look for .xml or .cr files
+        for p in sorted(self.base_path.rglob("*.xml")):
+            try:
+                if CommonRoadFileReader is None:
+                    # can't parse without reader; create a minimal record
+                    recs.append({"name": p.name + "=unknown", "file": str(p), "scenario_id": p.stem, "num_timesteps": 0})
+                    continue
+
+                reader = CommonRoadFileReader(str(p))
+                scenario, pps = reader.open()
+                T = infer_num_timesteps_from_scenario(scenario)
+                recs.append({"name": f"{p.name}={scenario.scenario_id}", "file": str(p), "scenario_id": str(scenario.scenario_id), "num_timesteps": int(T)})
+            except Exception:
+                # parsing failed - fall back to a lightweight record
+                recs.append({"name": p.name + "=unknown", "file": str(p), "scenario_id": p.stem, "num_timesteps": 0})
+        return recs
+
+    def load_scenario(self, rec: Dict[str, Any]) -> Tuple["Scenario", Optional[List[PlanningProblem]]]:
+        """Fully parse and return (scenario, planning_problem_set).
+
+        Raises if parsing fails. Keep this method isolated for easier error handling
+        and retries.
+        """
+        if CommonRoadFileReader is None:
+            raise RuntimeError("CommonRoadFileReader unavailable. Install commonroad-io to parse files.")
+        reader = CommonRoadFileReader(rec["file"])  # may raise
+        scenario, pps = reader.open()
+        return scenario, pps

@@ -1,0 +1,28 @@
+***UPDATE/PULL your repo BEFORE STARTING anything new NEXT TIME***
+
+1. Parts that are CommonRoad dependant : 
+    -> the main_simulation script
+    -> CommonRoadSimulation class (to change to TrajdataSimulation class)
+    -> RoutePlanner is also heavily intertwined with commonroad scenario
+    -> Sensor part also heavily intertwined with commonroad
+
+2. In CommonRoadSimulation:
+    -> To replicate collision checks in CommonRoadSimulation, yep
+    -> Also the visualization is needed too, but that can move outside the "for each timestep" loop and rather plot whole trajectory (after simulation/training over) together by trajdata api too.
+    -> Can probably ignore the check_feasibility, that basically uses the Vehicle model to check if plotted trajectory was correct or not.
+    -> Solution Writing structure can change to maybe some trajdata native statistics and other info etc.
+    -> 
+
+3. Have to integrate the planning problem i.e initial pose, final goal region, time interval for final goal etc. 
+    -> Will have to see if that can be intergrated into SceneMetadata (after overloading) or will i have to do jugaad in the dataset only and add new columns.
+    -> The first option is better as its just info related to the ego vehicle, and for commonroad the "ego" vehicle is not a part of the dynamic_obstacles list.
+    -> Can maybe create a new agent while generating dataset (at initial pose only always etc; or always at initial pose but at goal_pose in the time-interval), then while simulating, update that agent's trajectory from t_0 to t_f in a SceneBatchElement.
+    ->
+
+4. Naturally in the main_simulation part will have to create structure to initialize the Unified Dataset etc. too and pass required stuff, so that structure will change for sure.
+
+5. The Sensor part and RoutePlanner part 
+    -> Its very heavily commonroad linked tbh
+    -> And at each point it requires/uses map info too from the scenarios.
+    -> Thus, try using nuplan planner instead as its map-api is more similiar in a sense.
+    -> Observations, Predictions etc are also commonroad-based.

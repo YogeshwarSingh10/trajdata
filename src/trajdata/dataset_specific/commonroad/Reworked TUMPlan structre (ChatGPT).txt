@@ -1,0 +1,304 @@
+Good — I read everything you gave (including `scripts/main_simulation.py` and `config/simulation.yaml`) and thought it through. Below is a precise, actionable, exhaustive migration plan: what stays, what changes, what you must add, the utility files (what they contain and why), a call-graph, and a stepwise roadmap with checkpoints and tests. No fluff — straight to the point.
+
+References: I used your `main_simulation.py` and `config/simulation.yaml` as the current entry points.  
+
+---
+
+# Executive summary
+
+Migrate TUMPlan from CommonRoad → **Trajdata-native** by replacing all CommonRoad-dependent modules with Trajdata-native equivalents. Don't keep a persistent wrapper layer around CommonRoad; instead replace modules that *use* CR types with modules that use Trajdata types. Keep high-level architecture (simulator → planner → modules) intact. Add a small **Trajdata adapter/initializer** only at startup (one place) to create dataset objects / scene batches — not a deep wrapper.
+
+---
+
+# High-level design changes (big-picture)
+
+* **Entry**: `scripts/main_simulation.py` will remain the entry but must instantiate a `TrajdataSimulation` (change default config). 
+* **Simulator**: replace `commonroad_simulation.py` with `trajdata_simulation.py` (same `AbstractSimulator` interface).
+* **Route planner / sensor / perception / prediction**: rewrite CR-specific modules to consume Trajdata `Scene` / `SceneBatchElement` / `Agent` data structures directly.
+* **Utilities**: replace `tumplan/utils/data_types.py` with Trajdata-native data definitions (or remove if redundant) and add Trajdata helpers (scene/conversion/eval).
+* **Visualization**: move heavy plotting out of step loop; build post-run plotting using Trajdata scene objects.
+
+---
+
+# Files: what stays / changes / added (explicit)
+
+## Keep as-is (minimal or no change)
+
+* `pyproject.toml`, `README.md` (update docs)
+* `planner/*` architectural layout (abstract_planner.py, modular_planner, optimization_planner) — **logic** stays but internal interfaces to obstacle/map/scene will change.
+* `planner/cost_functions/*`, `feasibility_check/*`, `sampling/*` — keep algorithmic content; change data I/O interfaces only.
+* `tumplan/__init__.py` and general python package structure
+* `config/*` baseline idea (keep directory, rename or add trajdata-specific configs)
+* `scripts/main_debug_server.py` (if it's generic)
+
+## Files to be modified (rewrite internals to use Trajdata)
+
+* `scripts/main_simulation.py` — change dataset initialization & simulator instantiation to use Trajdata dataset and `TrajdataSimulation`. Update default overrides (config). 
+* `config/simulation.yaml` — change `defaults: - simulator: commonroad` → `- simulator: trajdata` and add trajdata loader configs. 
+* `tumplan/simulation/commonroad_simulation.py` → **replace** with `tumplan/simulation/trajdata_simulation.py` (implement same lifecycle methods: `set_planner`, `run`, `post_process_simulation`)
+* `tumplan/planner_inputs/route_planner/route_planner_CR.py` → `route_planner_trajdata.py` (use Trajdata's route / map info)
+* `tumplan/planner_inputs/perception/*` — modify to read observations from Trajdata scenes (agent states + sensor-cones if needed)
+* `tumplan/simulation/nuplan_simulation.py` — leave or deprecate depending on future multi-dataset support (optional)
+* `tumplan/utils/data_types.py` — remove CR-specific types; create Trajdata-light wrappers or mapping functions (see Utilities below)
+* `tumplan/utils/coordinate_conversion.py` — adjust to Trajdata coordinate conventions (if different)
+
+## Files to replace completely
+
+* `tumplan/simulation/commonroad_simulation.py` → `trajdata_simulation.py` (see above)
+* `tumplan/planner_inputs/route_planner/route_planner_CR.py` → `route_planner_trajdata.py`
+* Any code that constructs/queries a `CommonRoad` scenario object (search the repo for `commonroad`, `CR`, `common_road`, `cr_`) — replace those call sites with Trajdata calls.
+
+## New files to add (exact names + purpose)
+
+Place new code under `tumplan/trajdata/` or `tumplan/dataset/`:
+
+1. `tumplan/trajdata/initializer.py`
+
+   * Purpose: single bootstrapper that creates a Trajdata `UnifiedDataset`/`SceneBatch`/`SceneDataset` object based on `config.simulator.data_input`.
+   * Responsibilities: dataset selection, collate function, scene metadata augment (see goal metadata), instantiating loader iterators.
+   * Usage: called **only** in `main_simulation.py` before creating `TrajdataSimulation`.
+
+2. `tumplan/trajdata/scene_wrapper.py`
+
+   * Purpose: tiny helpers to access scene/agent/time slices in a consistent way (not a full wrapper — just helpers).
+   * Exposes: `get_ego(scene)`, `get_agents(scene)`, `get_map(scene)` etc.
+
+3. `tumplan/simulation/trajdata_simulation.py`
+
+   * Purpose: simulation class implementing `AbstractSimulator` API while working natively on Trajdata scenes.
+   * Responsibilities: stepping scenes, collision checks (use Trajdata agent geometry + own vehicle model), update ego trajectory, call planner to get controls, feed back to dataset or write outputs.
+
+4. `tumplan/utils/trajdata_eval.py`
+
+   * Purpose: evaluation helpers using Trajdata structures (metrics, statistics, export to dataset stats).
+
+5. `tumplan/utils/scene_metadata.py`
+
+   * Purpose: helpers to add/extend SceneMetadata (for initial pose, goal region, time window), or standardize the way planners accept initial/goal.
+
+6. `tumplan/config/trajdata/` (new config files)
+
+   * `trajdata_dataset.yaml` (dataset specific options), `trajdata_loader.yaml`.
+
+7. `tumplan/planner_inputs/route_planner/route_planner_trajdata.py`
+
+   * Purpose: route planning using Trajdata map/graph info (if dataset provides map); otherwise use lane-graph approximations from trajectories.
+
+8. `tumplan/visualization/trajdata_visualization.py`
+
+   * Purpose: post-run visualization using scene objects.
+
+## Small helper & housekeeping files to add
+
+* `tumplan/utils/compatibility_checks.py` — run quick validations on dataset-supplied columns/fields at startup; error early.
+* `tumplan/tests/test_trajdata_integration.py` — unit tests for initializer + simple scenario.
+
+---
+
+# Utility file specifications (usage / content details)
+
+### `tumplan/trajdata/initializer.py`
+
+* Inputs: `config.simulator.data_input` (path / dataset name + selection e.g., scenelist)
+* Work:
+
+  * instantiate Trajdata loader: loads `SceneDataset` or `UnifiedDataset` (whatever Trajdata exposes).
+  * run `compatibility_checks` to ensure required columns (`agent_id`, `state[:, x,y,heading,vx,vy]`, `timestep`) exist.
+  * Optionally extend `SceneMetadata` with `planning_problem` field: `{ego_init_pose, goal_region, goal_time_window}` (structured).
+* Returns: `dataset_loader` generator or list of `Scene` objects.
+* Reason: centralize interactions so rest of code receives standard `Scene` objects.
+
+### `tumplan/trajdata/scene_wrapper.py`
+
+* Functions:
+
+  * `get_ego(scene) -> AgentTrajectory` (explicit: if scene lacks a marked ego, use agent with `is_ego` flag or a config-provided agent_id).
+  * `get_agents(scene, t) -> list[AgentState]`
+  * `agent_bbox(agent_state) -> polygon`
+* Keep minimal — no emulation of entire Trajdata API.
+
+### `tumplan/utils/trajdata_eval.py`
+
+* Functions:
+
+  * `compute_collision(trajectory, agents, vehicle_model)`
+  * `compute_metrics(traj, gt)`
+  * `export_stats(log_path, dataset_meta, metrics)`
+
+### `tumplan/utils/scene_metadata.py`
+
+* Functions:
+
+  * `attach_planning_problem(scene, ego_init, goal_region, goal_time_window)` — persists metadata in `scene.metadata` for TUMPlan to read.
+* Reason: solves the "initial pose / goal region / time interval" problem without changing upstream dataset shape.
+
+---
+
+# Call graph / runtime flow (concise)
+
+```
+scripts/main_simulation.py
+  └─ create_config(...)  (reads config/simulation.yaml)
+  └─ trajdata.initializer.initialize(config)   <-- NEW (creates dataset/scene iterator)
+  └─ instantiate(config.simulator) -> TrajdataSimulation
+       ├─ set_planner(config.planner) -> returns Planner instance
+       └─ run():
+            for scene in dataset_loader:
+               sim.setup_scene(scene)
+               planner_inputs = perception.get_observations(scene,t0)   # use scene_wrapper
+               plan = planner.plan(planner_inputs, scene.metadata)
+               sim.apply_plan(plan)   # step ego; check feasibility; update logs
+            sim.post_process_simulation() -> call trajdata_visualization, write stats
+```
+
+Where `planner.plan()` may call:
+
+* `route_planner_trajdata.route()` (uses scene map or agent trajectories)
+* `prediction` (if required) — use Trajdata agent history to generate predictions or use stored predictions
+* `cost_functions.*`, `feasibility_check.*`, `sampling.*` — unchanged algorithms, with inputs converted from Trajdata `AgentState`
+
+---
+
+# Important design decisions & how to implement them (no-jugaad, native approach)
+
+1. **Single bootstrapper**: Only one place (`initializer.py`) touches Trajdata dataset construction. Rest of code consumes `Scene` objects. This is *not* a wrapper layer — it’s a necessary instantiation point.
+
+2. **No per-module wrappers**: Replace code that called `scenario.get_objects()` or `scenario.map` with direct calls to `scene` fields (via small helper functions in `scene_wrapper.py`). Search-and-replace the CR API usage and replace with standardized helper calls.
+
+3. **Initial ego & goal**:
+
+   * Best practice: store them in `scene.metadata.planning_problem` (added by `initializer`), not as a new agent in data. The planner reads `scene.metadata`.
+   * If dataset tooling prevents metadata extension, fallback: provide a config file mapping `scene_id -> planning_problem`. But prefer metadata.
+
+4. **Map & route**:
+
+   * Trajdata datasets often lack full HD map. If map exists, use route planner that queries the provided map. If not, build a lightweight lane-graph approximator from agent trajectories (snap historical paths into a topological graph) — implement as `route_planner_trajdata` fallback.
+
+5. **Collision checks / vehicle model**:
+
+   * Keep `VehicleModel` usage. Compute agent geometry from Trajdata agent shape fields or bounding box params.
+
+6. **Visualization**:
+
+   * Move per-step heavy plotting out of loop. Collect ego + agents trajectories; run `trajdata_visualization.plot_scene(scene)` at the end. This reduces runtime overhead.
+
+---
+
+# Migration roadmap (phased, checkpoints, tests)
+
+Do this in commits/PRs per phase (each phase ends with runnable tests):
+
+### Phase 0 — prep & discovery
+
+* Tasks:
+
+  * Run grep for `commonroad`, `CommonRoad`, `scenario.*`, `cr_` and produce a list of callsites.
+  * Identify all functions that reference CR datatypes.
+* Output: spreadsheet/list of affected files.
+* Test: successful list with at least 90% coverage of repository references.
+
+### Phase 1 — bootstrapper + config
+
+* Add `tumplan/trajdata/initializer.py` and config files `config/trajdata/*`.
+* Modify `scripts/main_simulation.py` to call initializer and instantiate `trajdata_simulation` (skeleton).
+* Update `config/simulation.yaml` default `simulator` to `trajdata`.
+* Test: run `python -m scripts.main_simulation` through startup — it should instantiate dataset loader and print basic stats (no simulation yet). (Unit test: `tests/test_initializer.py`)
+
+### Phase 2 — simulator base + scene helpers
+
+* Implement `tumplan/simulation/trajdata_simulation.py` skeleton implementing `run()` loop and invoking planner. Implement `scene_wrapper` helpers.
+* Replace `commonroad_simulation.py` references to use `trajdata_simulation`.
+* Test: feed a single scene from dataset and run simulation loop with a dummy planner that returns no-op trajectory; assert no exceptions and logs produced.
+
+### Phase 3 — planners & inputs (perception/pred/prediction)
+
+* Modify `tumplan/planner_inputs/perception/*`, `prediction/*` to accept Trajdata scenes (use `scene_wrapper`).
+* Replace `route_planner_CR` with `route_planner_trajdata` (start with basic path extraction from scene).
+* Test: run a planner end-to-end on a single scene; assert planner gets `ego_init`, `goal_region` from `scene.metadata` and returns planned trajectory.
+
+### Phase 4 — cost/feasibility/sampling integration
+
+* Hook existing `planner/cost_functions/*` to accept Trajdata input formats; add small adaptor functions where necessary.
+* Test: unit tests for cost functions with Trajdata-shaped inputs.
+
+### Phase 5 — visualization & evaluation
+
+* Implement `trajdata_visualization` to generate post-run plots, gifs and metrics using `trajdata_eval`.
+* Test: run full simulation for 1–3 scenes, produce plots and evaluation artifacts (same output format as earlier `logs/`).
+
+### Phase 6 — cleanup & removal
+
+* Delete CommonRoad-specific modules no longer used.
+* Update documentation, examples, and CI tests.
+* Test: run CI that runs a small end-to-end scenario.
+
+---
+
+# Testing checklist (what must be validated)
+
+* [ ] Startup: config loads, dataset loader created (no missing columns)
+* [ ] Single-scene loop: simulator.run() completes for 1 scene with dummy planner
+* [ ] Planner correctness: planner reads metadata (init+goal) correctly
+* [ ] Collision detection: computed collisions equal expected on known test scenes
+* [ ] Visualization: final outputs generated and comparable to prior outputs
+* [ ] Performance: simulation memory usage not exploding (spot-check)
+* [ ] Reproducibility: same planner + same dataset → identical outputs
+
+Add tests under `tumplan/tests/` and run via pytest.
+
+---
+
+# Edge cases, risks & mitigations
+
+1. **Maps missing or different formats**
+
+   * Risk: route planner expects HD map.
+   * Mitigation: implement fallback lane-graph builder from trajectories; keep route planner modular.
+
+2. **Scenes without explicit ego agent**
+
+   * Risk: Trajdata scenes may not mark ego.
+   * Mitigation: allow `initializer` to assert an ego via config (scene id mapping), or attach ego in `scene.metadata`.
+
+3. **Different time indexing**
+
+   * Risk: Trajdata uses different timestep sampling.
+   * Mitigation: convert to TUMPlan internal dt at initializer stage.
+
+4. **Large refactor causing breakage in many callsites**
+
+   * Mitigation: do incremental changes; keep a compatibility test harness that compares outputs of old CR run vs Trajdata run for a small set of scenarios.
+
+---
+
+# Concrete first-3 commits (what to code now — exact targets)
+
+1. **Commit A** — Add `tumplan/trajdata/initializer.py` (skeleton), add `config/trajdata/trajdata_dataset.yaml`, change `config/simulation.yaml` default simulator to `trajdata`, modify `main_simulation.py` to call initializer and log dataset stats. (Test: startup prints dataset size.)
+2. **Commit B** — Add `tumplan/trajdata/scene_wrapper.py` + `tests/test_scene_wrapper.py` for simple scene read functions. Implement `compatibility_checks`.
+3. **Commit C** — Add `tumplan/simulation/trajdata_simulation.py` skeleton, wire `instantiate(config.simulator)` to create it, and run loop with dummy planner. (Test: run single scene loop.)
+
+Make those three commits in separate branches/PRs to keep rollbacks easy.
+
+---
+
+# Notes on the “initial pose / goal integration” you mentioned
+
+* Preferred: **attach planning_problem to `scene.metadata`** in initializer. The planner reads `scene.metadata['planning_problem'] = {init_pose, goal_region, goal_time_window}`. This avoids adding fake agents or polluting the dataset.
+* Alternative only if modifying metadata is impossible: keep a separate `.yaml` mapping `scene_id -> planning_problem`, loaded by initializer and attached at runtime.
+
+---
+
+# Final checklist you can copy into PR description
+
+* [ ] All `commonroad` imports removed from runtime path
+* [ ] `scripts/main_simulation.py` now boots Trajdata initializer
+* [ ] `TrajdataSimulation` implements `AbstractSimulator` lifecycle
+* [ ] `scene_metadata` contains `planning_problem` for all test scenes
+* [ ] Unit tests for initializer, scene_wrapper, planner_inputs
+* [ ] Post-run visualization produces same required artifacts
+
+---
+
+If you want, I can:
+
+* produce the exact skeleton code for `initializer.py`, `trajdata_simulation.py`, and `scene_wrapper.py` (ready-to-drop in repo) next — pick that or I’ll produce the test stubs for the 3 first commits. Which of those two do you want *now*?

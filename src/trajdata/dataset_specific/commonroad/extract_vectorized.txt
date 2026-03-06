@@ -1,0 +1,43 @@
+1. Map Elements Storage (via Claude)
+    -> elements: DefaultDict[MapElementType, Dict[str, MapElement]]
+    -> This is a two-level dictionary:
+        First level: Groups by element type (ROAD_LANE, PED_CROSSWALK, etc.)
+        Second level: Maps element ID (string) to the actual element object
+    -> Types include (MapElementType):
+            ROAD_LANE = 1
+            ROAD_AREA = 2
+            PED_CROSSWALK = 3
+            PED_WALKWAY = 4
+    -> Out of these, RoadLane is Lanelet in CommonRoad
+    -> RoadArea is Intersection in CommonRoad but I might not use it as u have to give the polygon for the area of it. 
+    -> NOTE : Thus, For initial use, I'll keep the information from Intersection in the successors/predecessesors only maybe, for now. But will see how to make the lane to be honest.
+    -> LEFT : Will have to see if ComonRoad has Pedestrian Crosswalks and Walkways.
+
+2. DOUBT : Does ComonRoad have Pedestrian Crosswalks and Walkways?
+        
+2. Map Extent (Bounding Box)
+    extent: np.ndarray = [min_x, min_y, min_z, max_x, max_y, max_z]
+
+3. Map ID : (via Claude, this one sorta unsure)
+    Format: Usually "dataset_name:specific_map_name"
+
+5. PolyLine
+    -> Not a MapElement. Rather a supporting geometry type sort of.
+    -> expects np.ndarray of size 4 : x,y,z,h.
+
+4. RoadLane 
+    -> A type of MapElement
+    -> Check src for __init__ arguments. Some of the args are of PolyLine type.
+
+5. lanelet (CommonRoad) :
+    -> Contains left, right, center vertices as arrays.
+    -> Each array has only (x,y) coordinates. Not an issue though, Polyline (trajdata) handles it during initialization.
+
+6. DOUBT : Please explain how Intersections work here in CommonRoad... and how to extract the necessary information for the outgoing and incoming lanelets at an Intersection. 
+    Also again to confirm, u sort of just need the successor lanelets joined to each other right? Without the area as a Polygon? Then how will I get the connecting-lanelet? (which is inside the Intersection area)
+
+
+9. DOUBT : BICYCLE_LANE to be put in ROAD_LANE or PED_WALKWAY? like where do "bicycle" obstacles in commonroad run? if they run in lanes along with cars, then mayeb will put in road_lane, else in ped_walkways? altho ped_walkway isnt directional, thats only thing separating road_lane from the others actually. Trajdata doesnt differentiate only in car lanes or bicycle lanes.
+    -> put in PED_WALKWAY only for now.
+
+
